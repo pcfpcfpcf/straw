@@ -67,7 +67,7 @@ class Agent:
         url = self.api_url.rstrip("/")
         if url.endswith("/chat/completions"):
             return url
-        if not url.endswith(("/v1", "/api")):
+        if not url.endswith(("/v1", "/api", "/openai")):
             url += "/v1"
         return url + "/chat/completions"
 
@@ -99,7 +99,8 @@ class Agent:
         body = {"model": self.model, "messages": messages, "stream": False}
         if with_tools:
             body["tools"] = [t.schema() for t in self.tools_reg]
-            body["chat_template_kwargs"] = ROUTING_THINKING
+            if "googleapis.com" not in self.chat_url():
+                body["chat_template_kwargs"] = ROUTING_THINKING
             body["max_tokens"] = ROUTING_MAX_TOKENS
 
         headers = {"Content-Type": "application/json"}
