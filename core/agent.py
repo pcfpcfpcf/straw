@@ -111,7 +111,18 @@ class Agent:
         usage = {}
         try:
             resp = requests.post(self.chat_url(), json=body, headers=headers, timeout=LLM_TIMEOUT)
-            resp.raise_for_status()
+            if not resp.ok:
+                err_detail = resp.text
+                try:
+                    err_json = resp.json()
+                    if isinstance(err_json, dict) and "error" in err_json:
+                        err_detail = err_json["error"].get("message", resp.text)
+                    elif isinstance(err_json, list) and err_json and "error" in err_json[0]:
+                        err_detail = err_json[0]["error"].get("message", resp.text)
+                except Exception:
+                    pass
+                print(f"[error] LLM API returned HTTP {resp.status_code}: {err_detail}", flush=True)
+                raise RuntimeError(f"HTTP {resp.status_code} ({err_detail})")
             j = resp.json()
             usage = j.get("usage", {}) or {}
             choice = j["choices"][0]
