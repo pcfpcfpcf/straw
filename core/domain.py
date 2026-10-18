@@ -17,9 +17,10 @@ def _title(messages: list) -> str:
 
 
 class Domain:
-    def __init__(self, name, seed_prompt, db_conn=None):
+    def __init__(self, name, seed_prompt, db_conn=None, agent_options=None):
         self.name = name
         self.db_conn = db_conn
+        self.agent_options = agent_options or {} # per-domain Agent budgets (max_steps, max_tool_calls, ...)
         self.chats = Chats()
 
         self.reducers = {}
@@ -54,7 +55,8 @@ class Domain:
         
         return decorator
 
-    def tool(self, name: str, description: str, args: Dict[str, str] = None):
+    def tool(self, name: str, description: str, args: Dict[str, str] = None,
+             schemas: Dict[str, dict] = None, read_only: bool = False, ends_turn: bool = False):
         if args is None:
             args = {}
 
@@ -63,7 +65,10 @@ class Domain:
                 name=name,
                 description=description,
                 func=func,
-                args=args
+                args=args,
+                schemas=schemas or {},
+                read_only=read_only,
+                ends_turn=ends_turn
             )
             
             self.tools_reg.append(tool_instance)
@@ -134,6 +139,7 @@ class Domain:
                 api_key=llm.get("api_key", ""),
                 tools_reg=self.tools_reg,
                 system_prompt=self.system_prompt,
+                **self.agent_options,
             )
 
             prior, current = history[:-len(incoming)], history[-len(incoming):]

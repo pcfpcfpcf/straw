@@ -1,6 +1,7 @@
 import inspect
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 import requests
@@ -51,13 +52,23 @@ def execute_tool(tool: Tool, args: dict, ctx: dict) -> str:
 
 class Agent:
     def __init__(self, model: str, api_url: str, tools_reg: List[Tool],
-                 system_prompt: str, api_key: str = ""):
+                 system_prompt: str, api_key: str = "",
+                 max_steps: int = MAX_STEPS, max_tool_calls: int = MAX_TOOL_CALLS,
+                 max_tokens: int = ROUTING_MAX_TOKENS, chat_template_kwargs: dict = None,
+                 max_observation: int = 0):
         self.model = model
         self.api_url = api_url
         self.api_key = api_key
 
         self.tools_reg = tools_reg
         self.system_prompt = system_prompt
+
+        # per-domain budgets: a domain whose work takes many small steps needs more than the routing defaults
+        self.max_steps = max_steps
+        self.max_tool_calls = max_tool_calls
+        self.max_tokens = max_tokens # 0: no cap
+        self.chat_template_kwargs = chat_template_kwargs # None: ROUTING_THINKING, {}: none sent
+        self.max_observation = max_observation # 0: observations are never cut
 
     @staticmethod
     def find_tool(tools_reg, name: str) -> Tool | None:
@@ -70,6 +81,11 @@ class Agent:
         if not url.endswith(("/v1", "/api", "/openai")):
             url += "/v1"
         return url + "/chat/completions"
+
+    def template_kwargs(self) -> dict:
+        if self.chat_template_kwargs is not None:
+            return self.chat_template_kwargs
+        return {} if "googleapis.com" in self.chat_url() else ROUTING_THINKING
 
     @staticmethod
     def compact(history) -> str: #v1, dumb compact: keep the prompt, the tool calls and the answer, drop tool output
@@ -99,9 +115,11 @@ class Agent:
         body = {"model": self.model, "messages": messages, "stream": False}
         if with_tools:
             body["tools"] = [t.schema() for t in self.tools_reg]
-            if "googleapis.com" not in self.chat_url():
-                body["chat_template_kwargs"] = ROUTING_THINKING
-            body["max_tokens"] = ROUTING_MAX_TOKENS
+            template_kwargs = self.template_kwargs()
+            if template_kwargs:
+                body["chat_template_kwargs"] = template_kwargs
+            if self.max_tokens:
+                body["max_tokens"] = self.max_tokens
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -136,7 +154,8 @@ class Agent:
                   f"prompt_tok={usage.get('prompt_tokens')} cached_tok={cached} "
                   f"completion_tok={comp} tok/s={tps}", flush=True)
 
-    def run(self, messages: list, ctx: dict, max_steps: int = MAX_STEPS):
+    def run(self, messages: list, ctx: dict, max_steps: int = None):
+        max_steps = max_steps or self.max_steps
 
         # check if system_prompt func or str 
         prompt = self.system_prompt() if callable(self.system_prompt) else self.system_prompt
@@ -169,45 +188,96 @@ class Agent:
             if message.get("content"):
                 yield {"type": "thought", "content": message["content"]}
 
-            for call in calls[:MAX_TOOL_CALLS]:
-                yield from self.run_tool_call(call, ctx, messages, empties)
+            todo, i = calls[:self.max_tool_calls], 0
+            while i < len(todo):
+                group = self.next_group(todo, i)
+                before = len(messages)
+                yield from self.run_tool_group(group, ctx, messages, empties)
+                i += len(group)
 
-            for call in calls[MAX_TOOL_CALLS:]:
+                answer = self.turn_answer(group, messages[before:])
+                if answer is not None:
+                    messages.append({"role": "assistant", "content": answer})
+                    yield {"type": "answer", "content": answer, "converged": True}
+                    yield {"type": "final", "messages": messages[base:]}
+                    return
+
+            for call in calls[self.max_tool_calls:]:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": f"error: at most {MAX_TOOL_CALLS} tool calls per turn",
+                    "content": f"error: at most {self.max_tool_calls} tool calls per turn",
                 })
 
         yield from self.synthesize(messages)
         yield {"type": "final",
                "messages": [m for m in messages[base:] if m.get("content") != BUDGET_PROMPT]}
 
-    def run_tool_call(self, call: dict, ctx: dict, messages: list, empties: dict):
+    def is_read_only(self, call: dict) -> bool:
+        tool = Agent.find_tool(self.tools_reg, call["function"]["name"])
+        return bool(tool and tool.read_only)
+
+    def next_group(self, calls: list, i: int) -> list:
+        # consecutive read-only calls run together; anything that changes state runs alone, in the asked order
+        group = [calls[i]]
+        if not self.is_read_only(calls[i]):
+            return group
+        while i + len(group) < len(calls) and self.is_read_only(calls[i + len(group)]):
+            group.append(calls[i + len(group)])
+        return group
+
+    def turn_answer(self, group: list, added: list) -> str | None:
+        # the result of an ends_turn tool that worked is the answer
+        results = {m.get("tool_call_id"): m.get("content") or "" for m in added if m.get("role") == "tool"}
+        for call in group:
+            tool = Agent.find_tool(self.tools_reg, call["function"]["name"])
+            out = results.get(call["id"])
+            if tool and tool.ends_turn and out and not out.startswith("error"):
+                return out
+        return None
+
+    def observe(self, call: dict, ctx: dict, empties: dict) -> str:
+        # reads empties, never writes it: read-only calls of a group run on worker threads
         name = call["function"]["name"]
         raw_args = call["function"].get("arguments") or "{}"
 
-        yield {"type": "action", "tool": name, "content": raw_args} # to show reasoning steps
-
         tool = Agent.find_tool(self.tools_reg, name)
         if empties.get(name, 0) >= MAX_EMPTIES:
-            observation = (f"{name} has returned empty results {empties[name]} times already. "
-                           "State your conclusion from the data you have, or try a "
-                           "fundamentally different approach.")
-        elif not tool:
-            observation = f"error: unknown tool: {name}"
-        else:
-            try:
-                args = json.loads(raw_args)
-            except ValueError as e:
-                observation = f"error: {name}: invalid arguments: {e}"
-            else:
-                observation = execute_tool(tool, args, ctx)
-                if is_empty_result(observation):
-                    empties[name] = empties.get(name, 0) + 1
+            return (f"{name} has returned empty results {empties[name]} times already. "
+                    "State your conclusion from the data you have, or try a "
+                    "fundamentally different approach.")
+        if not tool:
+            return f"error: unknown tool: {name}"
+        try:
+            args = json.loads(raw_args)
+        except ValueError as e:
+            return f"error: {name}: invalid arguments: {e}"
+        if not isinstance(args, dict):
+            return f"error: {name}: arguments must be a JSON object"
 
-        yield {"type": "observation", "tool": name, "content": observation}
-        messages.append({"role": "tool", "tool_call_id": call["id"], "content": observation})
+        observation = execute_tool(tool, args, ctx)
+        if self.max_observation and len(observation) > self.max_observation:
+            observation = (observation[:self.max_observation]
+                           + f"\n...[cut: {len(observation) - self.max_observation} more characters]")
+        return observation
+
+    def run_tool_group(self, group: list, ctx: dict, messages: list, empties: dict):
+        for call in group: # to show reasoning steps
+            yield {"type": "action", "tool": call["function"]["name"],
+                   "content": call["function"].get("arguments") or "{}"}
+
+        if len(group) == 1:
+            observations = [self.observe(group[0], ctx, empties)]
+        else:
+            with ThreadPoolExecutor(max_workers=len(group)) as pool:
+                observations = list(pool.map(lambda c: self.observe(c, ctx, empties), group))
+
+        for call, observation in zip(group, observations):
+            name = call["function"]["name"]
+            if is_empty_result(observation):
+                empties[name] = empties.get(name, 0) + 1
+            yield {"type": "observation", "tool": name, "content": observation}
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": observation})
 
     def stream_llm(self, messages: list): #stream answer instead of waiting for the whole block
 

@@ -18,8 +18,11 @@ class Tool:
     description: str
     func: Callable[..., Any] = None
     args: Dict[str, str] = field(default_factory=dict)
+    schemas: Dict[str, dict] = field(default_factory=dict) # per-arg JSON schema overrides
+    read_only: bool = False # changes nothing: consecutive read-only calls of a step run at the same time
+    ends_turn: bool = False # a result that isn't an error is the turn's answer, no model call after it
 
-    def schema(self):  
+    def schema(self):
         sig = inspect.signature(self.func)
         props, required = {}, []
 
@@ -29,7 +32,10 @@ class Tool:
 
             props[pname] = {"type": JSON_TYPES.get(p.annotation, "string"),
                             "description": self.args.get(pname, "")}
-            
+            if props[pname]["type"] == "array": # some providers (gemini) reject arrays without items
+                props[pname]["items"] = {"type": "string"}
+            props[pname].update(self.schemas.get(pname, {}))
+
             if p.default is inspect.Parameter.empty:
                 required.append(pname)
 
