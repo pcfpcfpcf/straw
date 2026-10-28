@@ -38,6 +38,9 @@ class Domain:
         self._setup_routes()
 
     def _auth(self, authorization: str = Header(default="")):
+        # fail closed on every entry point, not only run(): an empty token would match a missing header
+        if not self.auth_token:
+            raise HTTPException(status_code=503, detail="STRAW_TOKEN is not configured")
         if not hmac.compare_digest(authorization.removeprefix("Bearer ").strip(), self.auth_token):
             raise HTTPException(status_code=401, detail="bad or missing service token")
 
